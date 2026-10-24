@@ -15,27 +15,32 @@ This is a test environment for trusted commands and images, not a security bound
 
 See [Podman setup](docs/podman-setup.md) for the optional Debian 13 community apt installer and its maintenance/trust tradeoffs. Installing the plugin does not install Podman, change system configuration, or enable a socket.
 
-## Load the plugin
+## Install the plugin
 
-Clone the repository, install its dependencies with `mise install` and `pnpm install --frozen-lockfile`, then add its absolute directory to your OpenCode configuration:
+Reference this Git repository's `main` branch in your OpenCode configuration. For global installation, add it to `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "/workspaces/opencode-podman-sandbox",
-      "options": {
-        "fallbackImage": "docker.io/library/debian:trixie-slim",
-      },
-    },
-  ],
+  "plugins": ["git+ssh://git@github.com/ThisDevDane/opencode-podman-sandbox.git#main"],
 }
 ```
 
-Merge this into existing configuration rather than replacing unrelated settings. The package exports TypeScript source, matching OpenCode's local-plugin loading support. It is not published to npm yet.
+Merge this into existing configuration rather than replacing unrelated settings. OpenCode fetches the repository and installs the plugin's dependencies. You do not need to clone it or run `mise` or `pnpm` yourself. The SSH URL uses your existing GitHub SSH credentials.
 
-The `options` object is optional. `fallbackImage` is used only when the agent omits the per-run `image` argument. The agent should normally choose an image matching the project and command, and that choice overrides the fallback for the new sandbox. Retained sandboxes keep their original image.
+Alternatively, this command installs the same Git reference and adds it to your global configuration:
+
+```sh
+opencode plugin add 'git+ssh://git@github.com/ThisDevDane/opencode-podman-sandbox.git#main'
+```
+
+To install later changes from `main`:
+
+```sh
+opencode plugin update 'git+ssh://git@github.com/ThisDevDane/opencode-podman-sandbox.git#main'
+```
+
+No plugin options are required. The agent should normally choose an image matching the project and command. `fallbackImage` is used only when the agent omits the per-run `image` argument. Retained sandboxes keep their original image.
 
 ## Tools
 
@@ -153,13 +158,23 @@ The plugin uses OpenCode permission actions `sandbox.run`, `sandbox.network`, `s
 
 ## Development
 
-The toolchain follows `opencode-rider-hooks`: Node 24, pnpm 12.14.0, strict erasable TypeScript, and native `node:test`. Oxlint handles linting and Oxfmt handles formatting.
+Clone the repository only if you want to work on the plugin:
+
+```sh
+git clone git@github.com:ThisDevDane/opencode-podman-sandbox.git
+cd opencode-podman-sandbox
+```
+
+The toolchain follows `opencode-rider-hooks`: Node 24, pnpm 12.14.0, strict erasable TypeScript, and native `node:test`. Oxlint handles linting. Oxfmt formats code and sorts imports. Mise also installs the shell and workflow checkers used by hk.
 
 ```sh
 mise install
 pnpm install --frozen-lockfile
 pnpm check
+mise exec -- hk check --all
 ```
+
+The mise environment puts project-local Node binaries on `PATH`, so hk uses the same Oxlint, Oxfmt, and TypeScript versions as pnpm. The hk checks also cover shell scripts and GitHub Actions workflows. Its pre-commit hook runs those checks without replacing the test suite.
 
 The default suite uses temporary fixtures and a fake Podman runner for lifecycle tests. To run the real engine test after rootless setup:
 

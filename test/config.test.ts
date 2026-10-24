@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { imageReference, sandboxOptions } from "../config.ts";
+
+import { imageReference, runSettings, sandboxOptions, type RunInput } from "../config.ts";
 
 test("defaults use a qualified image and bounded resources", () => {
   const options = sandboxOptions();
@@ -52,4 +53,53 @@ test("fallbackImage is configurable without renaming the per-run image argument"
     () => sandboxOptions({ image: "docker.io/library/node:24" }),
     /Unknown sandbox option: image/,
   );
+});
+
+test("run settings keep defaults separate from explicit per-call choices", () => {
+  const options = sandboxOptions();
+  assert.deepEqual(runSettings({ command: "true" }, options), {
+    timeoutMs: options.timeoutMs,
+    workdir: ".",
+  });
+  assert.deepEqual(runSettings({ command: "true", workdir: "src", timeoutMs: 50 }, options), {
+    timeoutMs: 50,
+    workdir: "src",
+  });
+});
+
+test("rejects invalid commands, networking, and changes to retained sandbox settings", () => {
+  const options = sandboxOptions();
+  for (const command of ["", " ", "true\0false"]) {
+    assert.throws(() => runSettings({ command }, options), /non-empty shell command/);
+  }
+  const invalidNetwork = { command: "true", network: "host" } as unknown as RunInput;
+  assert.throws(() => runSettings(invalidNetwork, options), /network must be none or pasta/);
+  assert.throws(
+    () =>
+      runSettings(
+        { command: "true", sandboxId: "existing", image: options.fallbackImage },
+        options,
+      ),
+    /cannot change/,
+  );
+  assert.throws(
+    () => runSettings({ command: "true", sandboxId: "existing", network: "none" }, options),
+    /cannot change/,
+  );
+});
+
+test("rejects unsafe working directories and out-of-range run timeouts", () => {
+  const options = sandboxOptions();
+  for (const workdir of ["/tmp", "..", "../outside", "src/../../outside", "bad\0path"]) {
+    assert.throws(
+      () => runSettings({ command: "true", workdir }, options),
+      /workdir must be relative/,
+    );
+  }
+  for (const timeoutMs of [0, -1, 0.5, Infinity, NaN, options.maxTimeoutMs + 1]) {
+    assert.throws(
+      () => runSettings({ command: "true", timeoutMs }, options),
+      /timeoutMs must be between/,
+    );
+  }
 });

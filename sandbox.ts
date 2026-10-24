@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, posix } from "node:path";
-import { imageReference, sandboxOptions, type SandboxOptions } from "./config.ts";
+import { join, posix } from "node:path";
+
+import {
+  imageReference,
+  runSettings,
+  sandboxOptions,
+  type RunInput,
+  type SandboxOptions,
+} from "./config.ts";
+import { hasErrorCode } from "./errors.ts";
 import { runProcess, succeeded, type ProcessOptions, type Runner } from "./process.ts";
 import {
   readBounded,
@@ -13,15 +21,15 @@ import {
   type Snapshot,
 } from "./workspace.ts";
 
-export interface RunInput {
-  command: string;
-  sandboxId?: string;
-  keep?: boolean;
-  image?: string;
-  network?: "none" | "pasta";
-  workdir?: string;
-  timeoutMs?: number;
-}
+export type { RunInput } from "./config.ts";
+
+const SANDBOX_LABEL = "io.github.thisdevdane.opencode-podman-sandbox=true";
+const KEEP_ALIVE_COMMAND = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done";
+const EXPERIMENT_NOTE = [
+  "The command ran in a disposable copy.",
+  "No changes have been applied to the source project.",
+  "Diffs cover /workspace only, not installed system packages or external services.",
+].join(" ");
 
 interface Sandbox {
   id: string;
@@ -41,9 +49,9 @@ export class SandboxManager {
   readonly options: SandboxOptions;
   readonly #runner: Runner;
   readonly #sandboxes = new Map<string, Sandbox>();
-  readonly #lifetime = new AbortController();
-  readonly #operations = new Set<Promise<unknown>>();
-  #creating = 0;
+  readonly #shutdownController = new AbortController();
+  readonly #activeOperations = new Set<Promise<unknown>>();
+  #pendingCreations = 0;
   #closed = false;
 
   constructor(options: Record<string, unknown> = {}, runner: Runner = runProcess) {
@@ -51,11 +59,11 @@ export class SandboxManager {
     this.#runner = runner;
   }
 
-  async #podman(args: string[], options: ProcessOptions = {}) {
+  async #runPodman(args: string[], processOptions: ProcessOptions = {}) {
     return this.#runner(this.options.podman, ["--remote=false", ...args], {
       timeoutMs: this.options.maxTimeoutMs,
       maxOutputBytes: this.options.maxOutputBytes,
-      ...options,
+      ...processOptions,
     });
   }
 
@@ -68,7 +76,7 @@ export class SandboxManager {
       throw new Error("This plugin requires local Linux Podman running as a non-root user.");
     }
     const result = succeeded(
-      await this.#podman(["info", "--format=json"], { signal }),
+      await this.#runPodman(["info", "--format=json"], { signal }),
       "Rootless Podman check",
     );
     const info = JSON.parse(result.stdout) as {
@@ -87,44 +95,59 @@ export class SandboxManager {
     };
   }
 
-  #track<T>(work: () => Promise<T>): Promise<T> {
-    if (this.#closed) return Promise.reject(new Error("Sandbox plugin is unloading."));
+  #trackOperation<T>(work: () => Promise<T>): Promise<T> {
+    if (this.#closed) {
+      return Promise.reject(new Error("Sandbox plugin is unloading."));
+    }
     const operation = work();
-    this.#operations.add(operation);
-    void operation.finally(() => this.#operations.delete(operation)).catch(() => {});
+    this.#activeOperations.add(operation);
+    // Track cleanup without turning a handled caller error into an unhandled rejection.
+    void operation.finally(() => this.#activeOperations.delete(operation)).catch(() => {});
     return operation;
   }
 
-  #get(owner: string, id: string): Sandbox {
+  #operationSignal(signal?: AbortSignal): AbortSignal {
+    const signals = [this.#shutdownController.signal];
+    if (signal) {
+      signals.push(signal);
+    }
+    return AbortSignal.any(signals);
+  }
+
+  #getIdleSandbox(owner: string, id: string): Sandbox {
     const sandbox = this.#sandboxes.get(id);
-    if (!sandbox || sandbox.owner !== owner) throw new Error("Sandbox not found in this session.");
-    if (sandbox.busy) throw new Error("Sandbox is busy. Wait for its current operation to finish.");
+    if (!sandbox || sandbox.owner !== owner) {
+      throw new Error("Sandbox not found in this session.");
+    }
+    if (sandbox.busy) {
+      throw new Error("Sandbox is busy. Wait for its current operation to finish.");
+    }
     return sandbox;
   }
 
-  async #create(
+  async #prepareWorkspace(
     owner: string,
     source: string,
     input: RunInput,
     signal: AbortSignal,
   ): Promise<Sandbox> {
-    if (this.#sandboxes.size + this.#creating >= this.options.maxSandboxes)
+    if (this.#sandboxes.size + this.#pendingCreations >= this.options.maxSandboxes) {
       throw new Error("Sandbox limit reached. Remove a retained sandbox first.");
-    this.#creating++;
-    let reserved = true;
+    }
+    this.#pendingCreations++;
     let directory: string | undefined;
-    let sandbox: Sandbox | undefined;
     try {
       await this.status(signal);
       directory = await mkdtemp(join(tmpdir(), "opencode-podman-sandbox-"));
-      if (directory.includes(":"))
+      if (directory.includes(":")) {
         throw new Error(
           "Podman sandbox temporary directory cannot contain a colon. Set TMPDIR to a plain local path.",
         );
+      }
       const workspace = join(directory, "workspace");
       const baseline = await snapshotProject(source, workspace, this.options, signal, this.#runner);
       const id = randomUUID();
-      sandbox = {
+      const sandbox: Sandbox = {
         id,
         owner,
         source,
@@ -139,72 +162,87 @@ export class SandboxManager {
       };
       // Register before provisioning so a failed create can still be cleaned up or retried.
       this.#sandboxes.set(id, sandbox);
-      this.#creating--;
-      reserved = false;
+      return sandbox;
+    } catch (error) {
+      if (directory) {
+        await rm(directory, { recursive: true, force: true });
+      }
+      throw error;
+    } finally {
+      // Once registered, the sandbox is counted by #sandboxes rather than this reservation.
+      this.#pendingCreations--;
+    }
+  }
+
+  #containerCreateArgs(sandbox: Sandbox): string[] {
+    return [
+      "create",
+      "--name",
+      sandbox.container,
+      "--label",
+      SANDBOX_LABEL,
+      "--network",
+      sandbox.network,
+      "--http-proxy=false",
+      "--image-volume=ignore",
+      "--user",
+      "0:0",
+      "--workdir",
+      "/workspace",
+      "--env",
+      "HOME=/root",
+      "--memory",
+      this.options.memory,
+      "--cpus",
+      String(this.options.cpus),
+      "--pids-limit",
+      String(this.options.pidsLimit),
+      "--security-opt",
+      "no-new-privileges",
+      "--volume",
+      `${sandbox.workspace}:/workspace:rw,Z`,
+      "--entrypoint",
+      "/bin/sh",
+      sandbox.image,
+      "-c",
+      KEEP_ALIVE_COMMAND,
+    ];
+  }
+
+  async #create(
+    owner: string,
+    source: string,
+    input: RunInput,
+    signal: AbortSignal,
+  ): Promise<Sandbox> {
+    const sandbox = await this.#prepareWorkspace(owner, source, input, signal);
+    try {
       succeeded(
-        await this.#podman(
-          [
-            "create",
-            "--name",
-            sandbox.container,
-            "--label",
-            "io.github.thisdevdane.opencode-podman-sandbox=true",
-            "--network",
-            sandbox.network,
-            "--http-proxy=false",
-            "--image-volume=ignore",
-            "--user",
-            "0:0",
-            "--workdir",
-            "/workspace",
-            "--env",
-            "HOME=/root",
-            "--memory",
-            this.options.memory,
-            "--cpus",
-            String(this.options.cpus),
-            "--pids-limit",
-            String(this.options.pidsLimit),
-            "--security-opt",
-            "no-new-privileges",
-            "--volume",
-            `${workspace}:/workspace:rw,Z`,
-            "--entrypoint",
-            "/bin/sh",
-            sandbox.image,
-            "-c",
-            "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
-          ],
-          { signal },
-        ),
+        await this.#runPodman(this.#containerCreateArgs(sandbox), { signal }),
         "Creating sandbox container",
       );
       succeeded(
-        await this.#podman(["start", sandbox.container], { signal }),
+        await this.#runPodman(["start", sandbox.container], { signal }),
         "Starting sandbox container",
       );
       return sandbox;
     } catch (error) {
-      if (sandbox) {
-        try {
-          await this.#destroy(sandbox);
-        } catch (cleanupError) {
-          sandbox.busy = false;
-          throw new AggregateError(
-            [error, cleanupError],
-            `Sandbox creation failed; cleanup also failed. Retained sandbox ID: ${sandbox.id}`,
-          );
-        }
-      } else if (directory) await rm(directory, { recursive: true, force: true });
+      try {
+        await this.#destroy(sandbox);
+      } catch (cleanupError) {
+        sandbox.busy = false;
+        throw new AggregateError(
+          [error, cleanupError],
+          `Sandbox creation failed; cleanup also failed. Retained sandbox ID: ${sandbox.id}`,
+        );
+      }
       throw error;
-    } finally {
-      if (reserved) this.#creating--;
     }
   }
 
   async #destroy(sandbox: Sandbox) {
     succeeded(
-      await this.#podman(
+      await this.#runPodman(
         ["rm", "--force", "--time=0", "--volumes", "--ignore", sandbox.container],
         { timeoutMs: 30_000 },
       ),
@@ -213,10 +251,12 @@ export class SandboxManager {
     try {
       await rm(sandbox.directory, { recursive: true, force: true });
     } catch (error) {
-      if (!["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      if (!hasErrorCode(error, "EACCES", "EPERM")) {
+        throw error;
+      }
       // Experiments can chown files to subordinate IDs. Only delete this manager's private directory.
       succeeded(
-        await this.#podman(["unshare", "rm", "-rf", "--", sandbox.directory], {
+        await this.#runPodman(["unshare", "rm", "-rf", "--", sandbox.directory], {
           timeoutMs: 30_000,
         }),
         `Removing workspace ${sandbox.directory}`,
@@ -239,45 +279,21 @@ export class SandboxManager {
   }
 
   run(owner: string, source: string, input: RunInput, signal?: AbortSignal) {
-    return this.#track(async () => {
-      if (
-        typeof input.command !== "string" ||
-        !input.command.trim() ||
-        input.command.includes("\0")
-      )
-        throw new Error("command must be a non-empty shell command without NUL bytes.");
-      if (input.network !== undefined && input.network !== "none" && input.network !== "pasta")
-        throw new Error("network must be none or pasta.");
-      if (input.image !== undefined) imageReference(input.image);
-      if (input.sandboxId && (input.image !== undefined || input.network !== undefined))
-        throw new Error("Image and network cannot change when reusing a sandbox.");
-      const timeoutMs = input.timeoutMs ?? this.options.timeoutMs;
-      if (
-        !Number.isSafeInteger(timeoutMs) ||
-        timeoutMs < 1 ||
-        timeoutMs > this.options.maxTimeoutMs
-      )
-        throw new Error(`timeoutMs must be between 1 and ${this.options.maxTimeoutMs}.`);
-      const workdir = input.workdir ?? ".";
-      if (
-        isAbsolute(workdir) ||
-        workdir.includes("\0") ||
-        posix.normalize(workdir).startsWith("../") ||
-        posix.normalize(workdir) === ".."
-      )
-        throw new Error("workdir must be relative to /workspace, without escaping it.");
-      const lifetime = AbortSignal.any([this.#lifetime.signal, ...(signal ? [signal] : [])]);
+    return this.#trackOperation(async () => {
+      const { timeoutMs, workdir } = runSettings(input, this.options);
+      const lifetime = this.#operationSignal(signal);
       lifetime.throwIfAborted();
       const root = await realpath(source);
       const sandbox = input.sandboxId
-        ? this.#get(owner, input.sandboxId)
+        ? this.#getIdleSandbox(owner, input.sandboxId)
         : await this.#create(owner, root, input, lifetime);
-      if (sandbox.source !== root)
+      if (sandbox.source !== root) {
         throw new Error("Sandbox belongs to a different project directory.");
+      }
       sandbox.busy = true;
-      let keep = input.keep ?? Boolean(input.sandboxId);
+      let retainSandbox = input.keep ?? Boolean(input.sandboxId);
       try {
-        const result = await this.#podman(
+        const result = await this.#runPodman(
           [
             "exec",
             "--workdir",
@@ -290,42 +306,44 @@ export class SandboxManager {
           { signal: lifetime, timeoutMs },
         );
         // Killing the client does not reliably kill podman exec. Destroy the container too.
-        if (result.timedOut || result.aborted) keep = false;
+        if (result.timedOut || result.aborted) {
+          retainSandbox = false;
+        }
         let diff: ReturnType<typeof workspaceDiff> | undefined;
         let inspectionError: string | undefined;
         if (!result.timedOut && !result.aborted) {
           try {
-            diff = workspaceDiff(
-              sandbox.baseline,
-              await scanWorkspace(sandbox.workspace, this.options, lifetime),
-              this.options.maxOutputBytes,
-            );
+            diff = await this.#workspaceChanges(sandbox, lifetime);
           } catch (error) {
             inspectionError = String(error);
           }
         }
         // Cancellation can arrive after exec exits, while files are being inspected.
         const aborted = result.aborted || lifetime.aborted;
-        if (aborted) keep = false;
+        if (aborted) {
+          retainSandbox = false;
+        }
         return {
           ...result,
           aborted,
-          sandboxId: keep ? sandbox.id : null,
-          retained: keep,
+          sandboxId: retainSandbox ? sandbox.id : null,
+          retained: retainSandbox,
           image: sandbox.image,
           network: sandbox.network,
           diff,
           inspectionError,
           omittedFromSnapshot: sandbox.baseline.omitted.slice(0, 100),
           omittedFromSnapshotCount: sandbox.baseline.omitted.length,
-          note: "The command ran in a disposable copy. No changes have been applied to the source project. Diffs cover /workspace only, not installed system packages or external services.",
+          note: EXPERIMENT_NOTE,
         };
       } catch (error) {
-        keep = false;
+        retainSandbox = false;
         throw error;
       } finally {
         try {
-          if (!keep) await this.#destroy(sandbox);
+          if (!retainSandbox) {
+            await this.#destroy(sandbox);
+          }
         } finally {
           sandbox.busy = false;
         }
@@ -333,35 +351,40 @@ export class SandboxManager {
     });
   }
 
+  async #workspaceChanges(sandbox: Sandbox, signal: AbortSignal) {
+    const current = await scanWorkspace(sandbox.workspace, this.options, signal);
+    return workspaceDiff(sandbox.baseline, current, this.options.maxOutputBytes);
+  }
+
+  async #readArtifact(sandbox: Sandbox, path: string) {
+    const target = await safePath(sandbox.workspace, path);
+    const stat = await lstat(target);
+    if (!stat.isFile()) {
+      throw new Error("Only regular files can be read. Symlinks are not followed.");
+    }
+    if (stat.size > this.options.maxOutputBytes) {
+      throw new Error(
+        `File exceeds ${this.options.maxOutputBytes} bytes. Inspect a smaller artifact inside the container.`,
+      );
+    }
+    const content = await readBounded(target, this.options.maxOutputBytes);
+    if (content.includes(0)) {
+      throw new Error("File is binary. Inspect it with a command inside the container.");
+    }
+    return { path, content: content.toString("utf8") };
+  }
+
   inspect(owner: string, id: string, path?: string, signal?: AbortSignal) {
-    return this.#track(async () => {
-      const sandbox = this.#get(owner, id);
+    return this.#trackOperation(async () => {
+      const sandbox = this.#getIdleSandbox(owner, id);
       sandbox.busy = true;
       try {
-        const lifetime = AbortSignal.any([this.#lifetime.signal, ...(signal ? [signal] : [])]);
+        const lifetime = this.#operationSignal(signal);
         lifetime.throwIfAborted();
         if (path !== undefined) {
-          const target = await safePath(sandbox.workspace, path);
-          if (!(await lstat(target)).isFile())
-            throw new Error("Only regular files can be read. Symlinks are not followed.");
-          const size = (await lstat(target)).size;
-          if (size > this.options.maxOutputBytes)
-            throw new Error(
-              `File exceeds ${this.options.maxOutputBytes} bytes. Inspect a smaller artifact inside the container.`,
-            );
-          const content = await readBounded(target, this.options.maxOutputBytes);
-          if (content.includes(0))
-            throw new Error("File is binary. Inspect it with a command inside the container.");
-          return { sandboxId: id, path, content: content.toString("utf8") };
+          return { sandboxId: id, ...(await this.#readArtifact(sandbox, path)) };
         }
-        return {
-          sandboxId: id,
-          ...workspaceDiff(
-            sandbox.baseline,
-            await scanWorkspace(sandbox.workspace, this.options, lifetime),
-            this.options.maxOutputBytes,
-          ),
-        };
+        return { sandboxId: id, ...(await this.#workspaceChanges(sandbox, lifetime)) };
       } finally {
         sandbox.busy = false;
       }
@@ -369,8 +392,8 @@ export class SandboxManager {
   }
 
   remove(owner: string, id: string) {
-    return this.#track(async () => {
-      const sandbox = this.#get(owner, id);
+    return this.#trackOperation(async () => {
+      const sandbox = this.#getIdleSandbox(owner, id);
       sandbox.busy = true;
       try {
         await this.#destroy(sandbox);
@@ -383,16 +406,17 @@ export class SandboxManager {
 
   async dispose() {
     this.#closed = true;
-    this.#lifetime.abort();
-    await Promise.allSettled([...this.#operations]);
+    this.#shutdownController.abort();
+    await Promise.allSettled(this.#activeOperations);
     const results = await Promise.allSettled(
       [...this.#sandboxes.values()].map((sandbox) => this.#destroy(sandbox)),
     );
     const failures = results.filter((result) => result.status === "rejected");
-    if (failures.length)
+    if (failures.length) {
       throw new AggregateError(
         failures.map((failure) => failure.reason),
-        "Some sandbox resources could not be removed. Use podman ps -a --filter label=io.github.thisdevdane.opencode-podman-sandbox=true to inspect leftovers.",
+        `Some sandbox resources could not be removed. Use podman ps -a --filter label=${SANDBOX_LABEL} to inspect leftovers.`,
       );
+    }
   }
 }

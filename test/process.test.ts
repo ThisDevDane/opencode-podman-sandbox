@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { runProcess } from "../process.ts";
+
+import { runProcess, succeeded, type ProcessResult } from "../process.ts";
 
 test("does not interpret arguments in a host shell", async () => {
   const result = await runProcess(process.execPath, [
@@ -49,4 +50,35 @@ test("cancellation stops commands and pre-aborted work never starts", async () =
 
 test("reports missing executables", async () => {
   await assert.rejects(runProcess("/not/an/installed/program", []), /Could not start/);
+});
+
+test("checks process success and preserves failure details", () => {
+  const success: ProcessResult = {
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+  };
+  assert.equal(succeeded(success, "Experiment"), success);
+
+  const failures: { result: Partial<ProcessResult>; message: string }[] = [
+    { result: { exitCode: 7 }, message: "Experiment failed: exit 7" },
+    { result: { exitCode: null }, message: "Experiment failed: exit null" },
+    {
+      result: { exitCode: 1, stdout: "output", stderr: "error" },
+      message: "Experiment failed: error",
+    },
+    { result: { exitCode: 1, stdout: "output" }, message: "Experiment failed: output" },
+    { result: { timedOut: true }, message: "Experiment failed (timed out): exit 0" },
+    { result: { aborted: true }, message: "Experiment failed (cancelled): exit 0" },
+    {
+      result: { timedOut: true, aborted: true },
+      message: "Experiment failed (timed out): exit 0",
+    },
+  ];
+  for (const { result, message } of failures) {
+    assert.throws(() => succeeded({ ...success, ...result }, "Experiment"), { message });
+  }
 });

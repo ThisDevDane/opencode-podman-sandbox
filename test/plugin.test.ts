@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
+
 import { register } from "../index.ts";
 import type { RunInput, SandboxManager } from "../sandbox.ts";
 
@@ -113,7 +115,9 @@ async function setupPlugin(
       assert: async (request: PermissionRequest) => {
         permissions.push(request);
         events.push(`permission:${request.action}`);
-        if (request.action === options.denyAction) throw new Error(`Denied ${request.action}`);
+        if (request.action === options.denyAction) {
+          throw new Error(`Denied ${request.action}`);
+        }
       },
     },
     tool: {

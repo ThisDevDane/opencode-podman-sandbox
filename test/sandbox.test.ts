@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+
 import { runProcess, type ProcessOptions, type ProcessResult, type Runner } from "../process.ts";
 import { SandboxManager } from "../sandbox.ts";
 
@@ -49,7 +50,9 @@ class FakeRunner {
   readonly run: Runner = async (executable, args, options) => {
     const call = { executable, args, options };
     this.calls.push(call);
-    if (executable === "git") return runProcess(executable, args, options);
+    if (executable === "git") {
+      return runProcess(executable, args, options);
+    }
 
     assert.equal(args[0], "--remote=false");
     switch (args[1]) {
@@ -345,12 +348,80 @@ test("counts in-flight creations toward capacity", async (t) => {
   assert.equal(fake.podmanCalls("create").length, 1);
 });
 
+test(
+  "reserves capacity while preparing a workspace, before a container exists",
+  { timeout: 5000 },
+  async (t) => {
+    const source = await fixture(t);
+    const fake = new FakeRunner();
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    const runner: Runner = async (executable, args, options) => {
+      if (args[1] === "info") {
+        entered.resolve();
+        await release.promise;
+      }
+      return fake.run(executable, args, options);
+    };
+    const manager = new SandboxManager({ maxSandboxes: 1 }, runner);
+    t.after(() => manager.dispose());
+
+    const preparing = manager.run("session-a", source, { command: "first" });
+    await entered.promise;
+    assert.equal(fake.podmanCalls("create").length, 0);
+    await assert.rejects(
+      manager.run("session-a", source, { command: "second" }),
+      /Sandbox limit reached/,
+    );
+    release.resolve();
+    await preparing;
+  },
+);
+
+test("a failed engine check releases its creation reservation", async (t) => {
+  const source = await fixture(t);
+  const fake = new FakeRunner();
+  let failEngineCheck = true;
+  const runner: Runner = async (executable, args, options) => {
+    if (args[1] === "info" && failEngineCheck) {
+      return result({ exitCode: 125, stderr: "engine unavailable" });
+    }
+    return fake.run(executable, args, options);
+  };
+  const manager = new SandboxManager({ maxSandboxes: 1 }, runner);
+  t.after(() => manager.dispose());
+
+  await assert.rejects(
+    manager.run("session-a", source, { command: "first" }),
+    /engine unavailable/,
+  );
+  assert.deepEqual(manager.list("session-a"), []);
+  failEngineCheck = false;
+  assert.equal((await manager.run("session-a", source, { command: "retry" })).exitCode, 0);
+});
+
+test("a failed snapshot releases its creation reservation", async (t) => {
+  const source = await fixture(t);
+  const fake = new FakeRunner();
+  const manager = managerFor(t, fake, { maxSandboxes: 1, maxSnapshotBytes: 1 });
+
+  await assert.rejects(manager.run("session-a", source, { command: "first" }), /Snapshot exceeds/);
+  assert.deepEqual(manager.list("session-a"), []);
+  assert.equal(fake.podmanCalls("create").length, 0);
+  await writeFile(join(source, "tracked.txt"), "");
+  assert.equal((await manager.run("session-a", source, { command: "retry" })).exitCode, 0);
+});
+
 for (const step of ["create", "start"] as const) {
   test(`cleans the container and private workspace when ${step} fails`, async (t) => {
     const source = await fixture(t);
     const fake = new FakeRunner();
-    if (step === "create") fake.create = () => result({ exitCode: 125, stderr: "create failed" });
-    else fake.failStart = true;
+    if (step === "create") {
+      fake.create = () => result({ exitCode: 125, stderr: "create failed" });
+    } else {
+      fake.failStart = true;
+    }
     const manager = managerFor(t, fake);
 
     await assert.rejects(
@@ -395,11 +466,13 @@ test("cancellation returns an aborted result and force-removes the container", a
     return new Promise((resolve) => {
       const signal = call.options?.signal;
       assert.ok(signal);
-      if (signal.aborted) resolve(result({ exitCode: null, aborted: true }));
-      else
+      if (signal.aborted) {
+        resolve(result({ exitCode: null, aborted: true }));
+      } else {
         signal.addEventListener("abort", () => resolve(result({ exitCode: null, aborted: true })), {
           once: true,
         });
+      }
     });
   };
   const manager = managerFor(t, fake);

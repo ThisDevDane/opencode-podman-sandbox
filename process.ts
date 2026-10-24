@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import { hasErrorCode } from "./errors.ts";
+
 export interface ProcessOptions {
   cwd?: string;
   signal?: AbortSignal;
@@ -34,46 +36,57 @@ export const runProcess: Runner = async (executable, args, options = {}) => {
     const limit = options.maxOutputBytes ?? 65_536;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    let bytes = 0;
+    let retainedBytes = 0;
     let truncated = false;
     let timedOut = false;
     let aborted = false;
-    let escalation: NodeJS.Timeout | undefined;
-    const kill = (signal: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      if (child.pid === undefined) {
+        return;
+      }
       try {
+        // Detached children have their own process group. Stop their subprocesses too.
         process.kill(-child.pid, signal);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(signal);
+        if (!hasErrorCode(error, "ESRCH")) {
+          child.kill(signal);
+        }
       }
     };
-    const stop = () => {
-      kill("SIGTERM");
-      escalation ??= setTimeout(() => kill("SIGKILL"), 1000);
-      escalation.unref();
+    const stopChild = () => {
+      killProcessGroup("SIGTERM");
+      forceKillTimer ??= setTimeout(() => killProcessGroup("SIGKILL"), 1000);
+      forceKillTimer.unref();
     };
     const onAbort = () => {
       aborted = true;
-      stop();
+      stopChild();
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      stop();
+      stopChild();
     }, options.timeoutMs ?? 120_000);
     timer.unref();
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) onAbort();
-    const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
-      const remaining = Math.max(0, limit - bytes);
-      if (chunk.length > remaining) truncated = true;
-      if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
-      bytes += Math.min(chunk.length, remaining);
+    if (options.signal?.aborted) {
+      onAbort();
+    }
+    const collectOutput = (chunks: Buffer[]) => (chunk: Buffer) => {
+      const remaining = Math.max(0, limit - retainedBytes);
+      if (chunk.length > remaining) {
+        truncated = true;
+      }
+      if (remaining > 0) {
+        chunks.push(chunk.subarray(0, remaining));
+      }
+      retainedBytes += Math.min(chunk.length, remaining);
     };
-    child.stdout.on("data", collect(stdout));
-    child.stderr.on("data", collect(stderr));
+    child.stdout.on("data", collectOutput(stdout));
+    child.stderr.on("data", collectOutput(stderr));
     const cleanup = () => {
       clearTimeout(timer);
-      clearTimeout(escalation);
+      clearTimeout(forceKillTimer);
       options.signal?.removeEventListener("abort", onAbort);
     };
     child.once("error", (error) => {
@@ -95,10 +108,16 @@ export const runProcess: Runner = async (executable, args, options = {}) => {
 };
 
 export function succeeded(result: ProcessResult, action: string): ProcessResult {
-  if (result.exitCode !== 0 || result.timedOut || result.aborted) {
-    throw new Error(
-      `${action} failed${result.timedOut ? " (timed out)" : result.aborted ? " (cancelled)" : ""}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`,
-    );
+  if (result.exitCode === 0 && !result.timedOut && !result.aborted) {
+    return result;
   }
-  return result;
+
+  let reason = "";
+  if (result.timedOut) {
+    reason = " (timed out)";
+  } else if (result.aborted) {
+    reason = " (cancelled)";
+  }
+  const details = result.stderr || result.stdout || `exit ${result.exitCode}`;
+  throw new Error(`${action} failed${reason}: ${details}`);
 }
