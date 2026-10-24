@@ -1,0 +1,8 @@
+# Preserve the pinned OpenCode V2 packages under pnpm's release-age policy.
+minimumReleaseAgeExclude:
+  - "@opencode/ai@2.1.0"
+  - "@opencode/client@2.1.0"
+  - "@opencode/plugin@2.1.0"
+  - "@opencode/protocol@2.1.0"
+  - "@opencode/schema@2.1.0"
+  - "@opencode/util@2.1.0"
